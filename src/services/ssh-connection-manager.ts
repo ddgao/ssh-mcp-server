@@ -268,6 +268,33 @@ export class SSHConnectionManager {
     };
   }
 
+  private formatCommandFailure(
+    stdout: string,
+    stderr: string,
+    exitCode?: number,
+    exitSignal?: string,
+  ): string {
+    const outputSections: string[] = [];
+
+    if (stdout) {
+      outputSections.push(stdout);
+    }
+
+    if (stderr) {
+      outputSections.push(`[stderr]\n${stderr}`);
+    }
+
+    if (exitCode !== undefined) {
+      outputSections.push(`[exit code] ${exitCode}`);
+    }
+
+    if (exitSignal) {
+      outputSections.push(`[signal] ${exitSignal}`);
+    }
+
+    return outputSections.join("\n");
+  }
+
   /**
    * Execute SSH command
    */
@@ -293,6 +320,7 @@ export class SSHConnectionManager {
 
     return new Promise<string>((resolve, reject) => {
       let timeoutId: NodeJS.Timeout;
+      let settled = false;
 
       // Cleanup function to clear timeout and prevent memory leaks
       const cleanup = () => {
@@ -317,6 +345,8 @@ export class SSHConnectionManager {
           // Initialize data buffers for stdout and stderr
           let data = "";
           let errorData = "";
+          let exitCode: number | undefined;
+          let exitSignal: string | undefined;
 
           // Set up event listeners for command output streams
           stream.on("data", (chunk: Buffer) => (data += chunk.toString())); // Collect stdout data
@@ -325,15 +355,63 @@ export class SSHConnectionManager {
             (chunk: Buffer) => (errorData += chunk.toString()), // Collect stderr data
           );
 
+          stream.on(
+            "exit",
+            (code: number | undefined, signal: string | undefined) => {
+              exitCode = code;
+              exitSignal = signal;
+            },
+          );
+
           // Handle command completion and exit code
-          stream.on("close", (code: number) => {
+          stream.on("close", (code?: number, signal?: string) => {
             cleanup();
-            resolve(data);
+            if (settled) {
+              return;
+            }
+            settled = true;
+
+            if (exitCode === undefined) {
+              exitCode = code;
+            }
+
+            if (!exitSignal && signal) {
+              exitSignal = signal;
+            }
+
+            const stdout = data.trimEnd();
+            const stderr = errorData.trimEnd();
+            const hasNonZeroExitCode =
+              exitCode !== undefined && exitCode !== 0;
+            const hasExitSignal =
+              exitSignal !== undefined && exitSignal !== "";
+
+            if (hasNonZeroExitCode || hasExitSignal) {
+              reject(
+                new Error(
+                  this.formatCommandFailure(
+                    stdout,
+                    stderr,
+                    exitCode,
+                    exitSignal,
+                  ) ||
+                    (hasExitSignal
+                      ? `Command terminated by signal ${exitSignal}${
+                          exitCode !== undefined ? ` (exit code ${exitCode})` : ""
+                        }`
+                      : `Command failed with exit code ${exitCode}`),
+                ),
+              );
+              return;
+            }
+
+            resolve(stdout);
           });
 
           // Handle stream errors during execution
           stream.on("error", (err: Error) => {
             cleanup();
+            settled = true;
             reject(new Error(`Stream error: ${err.message}`));
           });
 
@@ -344,6 +422,22 @@ export class SSHConnectionManager {
               stream.close();
             } catch (e) {
               // Ignore errors when closing streams during timeout
+            }
+
+            if (!settled) {
+              settled = true;
+              const stdout = data.trimEnd();
+              const stderr = errorData.trimEnd();
+              reject(
+                new Error(
+                  [
+                    this.formatCommandFailure(stdout, stderr),
+                    `[timeout] Command timed out after ${timeout}ms`,
+                  ]
+                    .filter(Boolean)
+                    .join("\n"),
+                ),
+              );
             }
           }, timeout);
         },
