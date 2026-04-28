@@ -8,6 +8,9 @@ export type ToolErrorCode =
   | "LOCAL_FILE_READ_FAILED"
   | "LOCAL_FILE_WRITE_FAILED"
   | "SFTP_ERROR"
+  | "GATESHELL_PARSE_TIMEOUT"
+  | "GATESHELL_CONNECT_FAILED"
+  | "GATESHELL_NOT_CONNECTED"
   | "UNKNOWN_ERROR";
 
 export class ToolError extends Error {

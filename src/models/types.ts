@@ -15,6 +15,7 @@ export interface SSHConfig {
   socksProxy?: string; // SOCKS proxy URL, e.g. 'socks://user:pass@host:port'
   pty?: boolean; // Allocate pseudo-tty for command execution, default: true
   allowedLocalPaths?: string[]; // Allowed local paths for upload/download
+  type?: 'direct' | 'gateshell';
 }
 
 /**

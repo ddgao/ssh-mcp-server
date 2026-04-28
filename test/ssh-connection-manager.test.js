@@ -202,4 +202,65 @@ describe('SSH Connection Manager', () => {
       assert.strictEqual(config.host, '2.2.2.2');
     });
   });
+
+  describe('GateShell 配置支持', () => {
+    it('应接受 type=gateshell 的配置', () => {
+      manager.setConfig({
+        bastion: {
+          name: 'bastion',
+          type: 'gateshell',
+          host: '10.0.0.1',
+          port: 60022,
+          username: 'admin',
+          password: 'pass123',
+        }
+      });
+      const config = manager.getConfig('bastion');
+      assert.strictEqual(config.type, 'gateshell');
+    });
+
+    it('未穿透时 executeCommand 应返回 GATESHELL_NOT_CONNECTED 错误', async () => {
+      manager.setConfig({
+        bastion: {
+          name: 'bastion',
+          type: 'gateshell',
+          host: '10.0.0.1',
+          port: 60022,
+          username: 'admin',
+          password: 'pass123',
+        }
+      });
+      await assert.rejects(
+        () => manager.executeCommand('ls', undefined, 'bastion'),
+        (err) => {
+          assert.strictEqual(err.code, 'GATESHELL_NOT_CONNECTED');
+          return true;
+        }
+      );
+    });
+
+    it('getAllServerInfos 应包含 gateshell 类型的服务器', () => {
+      manager.setConfig({
+        bastion: {
+          name: 'bastion',
+          type: 'gateshell',
+          host: '10.0.0.1',
+          port: 60022,
+          username: 'admin',
+          password: 'pass123',
+        },
+        direct: {
+          name: 'direct',
+          host: '10.0.0.2',
+          port: 22,
+          username: 'root',
+          password: 'pass',
+        }
+      });
+      const infos = manager.getAllServerInfos();
+      assert.strictEqual(infos.length, 2);
+      assert.ok(infos.find(i => i.name === 'bastion'));
+      assert.ok(infos.find(i => i.name === 'direct'));
+    });
+  });
 });

@@ -11,6 +11,7 @@ import { ToolError } from "../utils/tool-error.js";
 import fs from "fs";
 import path from "path";
 import { SFTPWrapper } from "ssh2";
+import { GateShellManager } from "./gateshell-manager.js";
 
 /**
  * SSH Connection Manager class
@@ -26,6 +27,7 @@ export class SSHConnectionManager {
   private commandWhitelistRegexes: Map<string, RegExp[]> = new Map();
   private commandBlacklistRegexes: Map<string, RegExp[]> = new Map();
   private defaultName: string = "default";
+  private gateshellManagers: Map<string, GateShellManager> = new Map();
 
   private constructor() {}
 
@@ -382,6 +384,22 @@ export class SSHConnectionManager {
     name?: string,
     options: { timeout?: number } = {},
   ): Promise<string> {
+    const config = this.getConfig(name);
+    if (config.type === 'gateshell') {
+      const gsManager = this.gateshellManagers.get(name || this.defaultName);
+      if (!gsManager || !gsManager.isConnectedToServer()) {
+        throw new ToolError(
+          'GATESHELL_NOT_CONNECTED',
+          'Not connected to any server through GateShell. Call connect-gateshell-server first.',
+          false,
+        );
+      }
+      const commandToRun = directory
+        ? `cd -- ${JSON.stringify(directory)} && ${cmdString}`
+        : cmdString;
+      return gsManager.executeCommand(commandToRun, options.timeout || 30000);
+    }
+
     // Validate command input and security
     const validationResult = this.validateCommand(cmdString, name);
     if (!validationResult.isAllowed) {
@@ -395,8 +413,7 @@ export class SSHConnectionManager {
     // Ensure SSH connection is established
     const client = await this.ensureConnected(name);
 
-    // Get configuration to check PTY setting
-    const config = this.getConfig(name);
+    // Get configuration to check PTY setting (config already declared above)
 
     const commandToRun = directory
       ? `cd -- ${JSON.stringify(directory)} && ${cmdString}`
@@ -713,6 +730,11 @@ export class SSHConnectionManager {
       this.clients.clear();
     }
 
+    for (const gsManager of this.gateshellManagers.values()) {
+      gsManager.close();
+    }
+    this.gateshellManagers.clear();
+
     this.connected.clear();
     this.statusCache.clear();
     this.pendingConnections.clear();
@@ -743,5 +765,16 @@ export class SSHConnectionManager {
         status: status,
       };
     });
+  }
+
+  public getGateShellManager(name?: string): GateShellManager {
+    const key = name || this.defaultName;
+    let gsManager = this.gateshellManagers.get(key);
+    if (!gsManager) {
+      const client = this.getClient(key);
+      gsManager = new GateShellManager(client);
+      this.gateshellManagers.set(key, gsManager);
+    }
+    return gsManager;
   }
 }
