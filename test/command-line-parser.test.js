@@ -284,6 +284,34 @@ Host testhost
     });
   });
 
+  describe('GateShell type 支持', () => {
+    it('config file 中的 type=gateshell 应被正确解析', () => {
+      const gateshellConfigPath = path.join(__dirname, 'fixtures', 'test-gateshell-config.json');
+      fs.writeFileSync(gateshellConfigPath, JSON.stringify([
+        {
+          name: 'bastion',
+          type: 'gateshell',
+          host: '10.0.0.1',
+          port: 60022,
+          username: 'admin',
+          password: 'pass123',
+        }
+      ]));
+
+      process.argv = ['node', 'index.js', '--config-file', gateshellConfigPath];
+
+      try {
+        const result = CommandLineParser.parseArgs();
+        assert.strictEqual(result.configs.bastion.type, 'gateshell');
+        assert.strictEqual(result.configs.bastion.host, '10.0.0.1');
+        assert.strictEqual(result.configs.bastion.port, 60022);
+      } finally {
+        process.argv = originalArgv;
+        fs.unlinkSync(gateshellConfigPath);
+      }
+    });
+  });
+
   describe('优先级测试', () => {
     it('配置文件应优先于 --ssh 参数', () => {
       const sshJson = JSON.stringify({ name: 'test', host: '1.1.1.1', port: 22, username: 'user1', password: 'pass1' });

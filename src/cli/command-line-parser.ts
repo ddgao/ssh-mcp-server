@@ -234,6 +234,7 @@ export class CommandLineParser {
     
     return {
       name: conf.name,
+      type: conf.type || undefined,
       host: conf.host,
       port,
       username: conf.user,
@@ -279,6 +280,7 @@ export class CommandLineParser {
     
     return {
       name: config.name,
+      type: config.type || undefined,
       host: config.host,
       port,
       username: config.username || config.user,
