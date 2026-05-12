@@ -5,6 +5,7 @@ import { registerDownloadTool } from "./download.js";
 import { registerListServersTool } from "./list-servers.js";
 import { registerListGateShellServersTool } from "./list-gateshell-servers.js";
 import { registerConnectGateShellServerTool } from "./connect-gateshell-server.js";
+import { registerDisconnectTool } from "./disconnect.js";
 
 /**
  * Register all tools
@@ -17,4 +18,5 @@ export function registerAllTools(server: McpServer): void {
   registerListServersTool(server);
   registerListGateShellServersTool(server);
   registerConnectGateShellServerTool(server);
+  registerDisconnectTool(server);
 } 

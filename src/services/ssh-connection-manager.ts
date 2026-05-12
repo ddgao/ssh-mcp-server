@@ -715,6 +715,42 @@ export class SSHConnectionManager {
   }
 
   /**
+   * Disconnect SSH connection by name
+   */
+  public disconnectByName(name: string): void {
+    const key = name || this.defaultName;
+    if (!this.configs[key]) {
+      throw new ToolError(
+        "SSH_CONNECTION_FAILED",
+        `SSH connection '${key}' not found`,
+        false,
+      );
+    }
+
+    const statusTimeout = this.pendingStatusCollections.get(key);
+    if (statusTimeout) {
+      clearTimeout(statusTimeout);
+      this.pendingStatusCollections.delete(key);
+    }
+
+    const client = this.clients.get(key);
+    if (client) {
+      client.end();
+      this.clients.delete(key);
+    }
+
+    const gsManager = this.gateshellManagers.get(key);
+    if (gsManager) {
+      gsManager.close();
+      this.gateshellManagers.delete(key);
+    }
+
+    this.connected.set(key, false);
+    this.statusCache.delete(key);
+    this.pendingConnections.delete(key);
+  }
+
+  /**
    * Disconnect SSH connection
    */
   public disconnect(): void {
