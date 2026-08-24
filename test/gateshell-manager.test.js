@@ -123,4 +123,45 @@ describe('GateShellManager', () => {
       assert.strictEqual(result[2].group, 'staging');
     });
   });
+
+  describe('extractCommandOutput / commandFinished', () => {
+    let extractCommandOutput, commandFinished;
+
+    before(async () => {
+      const mod = await import('../build/services/gateshell-manager.js');
+      extractCommandOutput = mod.extractCommandOutput;
+      commandFinished = mod.commandFinished;
+    });
+
+    it('应抽出标记前的命令结果', () => {
+      const raw = 'hostname; printf ...\nhost-01\n__END_abcd1234__\n';
+      assert.strictEqual(extractCommandOutput(raw, '__END_abcd1234__'), 'host-01');
+    });
+
+    it('回显与结果之间没有额外行时也不应切空', () => {
+      const raw = "echo hello-from-$(hostname); printf '\\n%s\\n' '__END_abcd1234__'\nhello-from-emall-prd-01\n__END_abcd1234__\n";
+      assert.strictEqual(
+        extractCommandOutput(raw, '__END_abcd1234__'),
+        'hello-from-emall-prd-01',
+      );
+    });
+
+    it('应兼容 \\r\\n 和 ANSI', () => {
+      const raw = "hostname; printf '\\n%s\\n' '__END_abcd1234__'\r\n\x1B[32mok\x1B[0m\r\n__END_abcd1234__\r\n";
+      assert.strictEqual(extractCommandOutput(raw, '__END_abcd1234__'), 'ok');
+      assert.strictEqual(commandFinished(raw, '__END_abcd1234__'), true);
+    });
+
+    it('标记单独出现也应视为结束', () => {
+      assert.strictEqual(commandFinished('__END_abcd1234__', '__END_abcd1234__'), true);
+      assert.strictEqual(commandFinished('still running', '__END_abcd1234__'), false);
+    });
+
+    it('命令回显里夹着标记不应视为结束', () => {
+      assert.strictEqual(
+        commandFinished('echo hello; echo __END_abcd1234__', '__END_abcd1234__'),
+        false,
+      );
+    });
+  });
 });

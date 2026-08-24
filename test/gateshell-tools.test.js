@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { formatGateShellServerList } from '../build/tools/list-gateshell-servers.js';
+import { formatGateShellListResult, formatGateShellServerList } from '../build/tools/list-gateshell-servers.js';
 
 describe('GateShell Tools', () => {
   describe('formatGateShellServerList', () => {
@@ -19,6 +19,26 @@ describe('GateShell Tools', () => {
     it('空列表应返回无服务器提示', () => {
       const output = formatGateShellServerList([]);
       assert.match(output, /No servers/i);
+    });
+  });
+
+  describe('formatGateShellListResult', () => {
+    it('已进入业务机时应返回缓存列表和 current，而不是空菜单', () => {
+      const servers = [
+        { index: 1, name: 'web-01', host: '10.0.0.1:22', protocol: 'ssh', username: 'root' },
+        { index: 6, name: 'emall-prd-01', host: '192.168.56.11:22', protocol: 'ssh', username: 'root' },
+      ];
+      const output = formatGateShellListResult({
+        servers,
+        phase: 'server',
+        currentServer: servers[1],
+        reusedCache: true,
+      });
+      assert.match(output, /006.*emall-prd-01/);
+      assert.match(output, /phase: server/);
+      assert.match(output, /current: 006 emall-prd-01/);
+      assert.match(output, /cached list/i);
+      assert.doesNotMatch(output, /No servers/i);
     });
   });
 });

@@ -11,7 +11,7 @@ export function registerConnectGateShellServerTool(server: McpServer): void {
     "connect-gateshell-server",
     {
       description:
-        "Connect to a specific server behind a GateShell (bastion host) by its index. Use list-gateshell-servers first to get available servers.",
+        "Connect to a specific server behind a GateShell (bastion host) by its index. Use list-gateshell-servers first. After connecting, execute-command runs on that backend host; list-gateshell-servers will return the cached menu plus the current host.",
       inputSchema: {
         serverIndex: z.number().describe("Server index from the GateShell server list"),
         connectionName: z

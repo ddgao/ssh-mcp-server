@@ -13,7 +13,8 @@ export function registerExecuteCommandTool(server: McpServer): void {
   server.registerTool(
     "execute-command",
     {
-      description: "Execute command on connected server and get output result",
+      description:
+        "Execute command on connected server and get output result. For GateShell connections, call list-gateshell-servers then connect-gateshell-server first.",
       inputSchema: {
         cmdString: z.string().describe("Command to execute"),
         directory: z.string().optional().describe("Working directory for command execution"),

@@ -14,6 +14,15 @@ export interface ServerEntry {
   group?: string;
 }
 
+export type GateShellPhase = 'closed' | 'menu' | 'server';
+
+export interface ListServersResult {
+  servers: ServerEntry[];
+  phase: GateShellPhase;
+  currentServer?: ServerEntry;
+  reusedCache: boolean;
+}
+
 /** 移除 ANSI 转义序列，保留逻辑换行 */
 export function stripAnsi(str: string): string {
   return str
@@ -50,12 +59,43 @@ export function parseServerList(rawOutput: string): ServerEntry[] {
   return entries;
 }
 
+/** 从命令输出中抽出结束标记之前的结果，兼容 \\r\\n / ANSI / 同行回显 */
+export function extractCommandOutput(rawOutput: string, marker: string): string {
+  const output = stripAnsi(rawOutput);
+  const lines = output.split('\n');
+  const markerIdx = lines.findIndex((l) => l.trim() === marker);
+  const before = markerIdx === -1 ? lines : lines.slice(0, markerIdx);
+
+  while (before.length && !before[0].trim()) before.shift();
+  if (before.length && isCommandEchoLine(before[0], marker)) {
+    before.shift();
+  }
+
+  return before.join('\n').trim();
+}
+
+function isCommandEchoLine(line: string, marker: string): boolean {
+  return line.includes('; printf')
+    || line.includes('; echo ')
+    || line.includes("printf '\\n%s\\n'")
+    || (line.includes(marker) && (line.includes('printf') || line.includes('echo')));
+}
+
+export function commandFinished(rawOutput: string, marker: string): boolean {
+  return outputContainsStandaloneMarker(stripAnsi(rawOutput), marker);
+}
+
+export function outputContainsStandaloneMarker(text: string, marker: string): boolean {
+  return text.split(/\r?\n/).some((line) => line.trim() === marker);
+}
+
 // --- GateShellManager 类 ---
 
 export class GateShellManager {
   private channel: ClientChannel | null = null;
-  private connectedToServer = false;
+  private phase: GateShellPhase = 'closed';
   private cachedServerList: ServerEntry[] = [];
+  private currentServerIndex: number | null = null;
   private readonly sessionId = crypto.randomUUID();
 
   constructor(private readonly sshClient: Client) {}
@@ -76,7 +116,8 @@ export class GateShellManager {
 
       const onData = (data: Buffer) => {
         buf += data.toString('utf-8');
-        if (markers.some(m => buf.includes(m))) {
+        const cleaned = stripAnsi(buf);
+        if (markers.some((m) => outputContainsStandaloneMarker(cleaned, m) || outputContainsStandaloneMarker(buf, m))) {
           clearTimeout(timer);
           ch.removeListener('data', onData);
           resolve(buf);
@@ -95,8 +136,25 @@ export class GateShellManager {
     return full.substring(startIdx + startMarker.length, endIdx !== -1 ? endIdx : undefined);
   }
 
-  /** 打开 GateShell 交互式 shell */
+  hasChannel(): boolean {
+    return this.channel !== null;
+  }
+
+  getPhase(): GateShellPhase {
+    return this.phase;
+  }
+
+  getCurrentServer(): ServerEntry | undefined {
+    if (this.currentServerIndex === null) return undefined;
+    return this.cachedServerList.find((s) => s.index === this.currentServerIndex);
+  }
+
+  /** 打开 GateShell 交互式 shell。已有 channel 时复用，避免把菜单/业务机会话冲掉。 */
   async openShell(): Promise<void> {
+    if (this.channel) {
+      Logger.log(`[GateShell:${this.sessionId}] Reusing existing shell (phase=${this.phase})`);
+      return;
+    }
     return new Promise<void>((resolve, reject) => {
       // 设置较大的终端窗口，确保堡垒机能一次输出完整的服务器列表
       const shellOpts = { term: 'xterm', rows: 200, cols: 200 };
@@ -106,6 +164,7 @@ export class GateShellManager {
           return;
         }
         this.channel = channel;
+        this.phase = 'menu';
         Logger.log(`[GateShell:${this.sessionId}] Shell opened`);
         resolve();
       });
@@ -117,7 +176,7 @@ export class GateShellManager {
     if (!this.channel) {
       throw new ToolError('GATESHELL_NOT_CONNECTED', 'No channel available');
     }
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<string>((resolve) => {
       let buf = '';
       const ch = this.channel!;
       let idleTimer: ReturnType<typeof setTimeout>;
@@ -148,27 +207,71 @@ export class GateShellManager {
     });
   }
 
-  /** 列出可用服务器 */
-  async listServers(): Promise<ServerEntry[]> {
+  /** 列出可用服务器。已进入业务机时默认返回缓存，避免把 bash 输出当成空菜单。 */
+  async listServers(options: { refresh?: boolean } = {}): Promise<ListServersResult> {
     if (!this.channel) {
       throw new ToolError('GATESHELL_NOT_CONNECTED', 'Shell not opened');
     }
-    // 先消费 openShell 后堡垒机可能已经输出的初始数据（欢迎信息+服务器列表）
+
+    if (this.phase === 'server' && !options.refresh) {
+      Logger.log(
+        `[GateShell:${this.sessionId}] Returning cached list (${this.cachedServerList.length} servers, on index ${this.currentServerIndex})`,
+      );
+      return {
+        servers: this.cachedServerList,
+        phase: this.phase,
+        currentServer: this.getCurrentServer(),
+        reusedCache: true,
+      };
+    }
+
+    if (this.phase === 'server' && options.refresh) {
+      await this.disconnectServer();
+    }
+
+    if (this.phase === 'menu' && this.cachedServerList.length > 0 && !options.refresh) {
+      Logger.log(`[GateShell:${this.sessionId}] Returning cached menu list (${this.cachedServerList.length} servers)`);
+      return {
+        servers: this.cachedServerList,
+        phase: this.phase,
+        currentServer: this.getCurrentServer(),
+        reusedCache: true,
+      };
+    }
+
+    const servers = await this.readMenuServerList();
+    this.cachedServerList = servers;
+    this.phase = servers.length > 0 ? 'menu' : this.phase;
+    Logger.log(`[GateShell:${this.sessionId}] Found ${servers.length} servers`);
+    return {
+      servers,
+      phase: this.phase,
+      currentServer: this.getCurrentServer(),
+      reusedCache: false,
+    };
+  }
+
+  private async readMenuServerList(): Promise<ServerEntry[]> {
     const initialOutput = await this.readUntilIdle(3000, 15000);
     Logger.log(`[GateShell:${this.sessionId}] Initial output length: ${initialOutput.length}`);
-    let servers = parseServerList(initialOutput);
-    if (servers.length > 0) {
-      this.cachedServerList = servers;
-      Logger.log(`[GateShell:${this.sessionId}] Found ${servers.length} servers from initial output`);
-      return this.cachedServerList;
+    const fromInitial = parseServerList(initialOutput);
+    if (fromInitial.length > 0) {
+      Logger.log(`[GateShell:${this.sessionId}] Found ${fromInitial.length} servers from initial output`);
+      return fromInitial;
     }
-    // 如果初始输出没有服务器列表，发送回车触发
-    this.channel.write('\r');
+    this.channel!.write('\r');
     const output = await this.readUntilIdle(5000, 30000);
     Logger.log(`[GateShell:${this.sessionId}] After enter output length: ${output.length}`);
-    this.cachedServerList = parseServerList(output);
-    Logger.log(`[GateShell:${this.sessionId}] Found ${this.cachedServerList.length} servers`);
-    return this.cachedServerList;
+    const parsed = parseServerList(output);
+    if (parsed.length > 0) return parsed;
+
+    if (this.cachedServerList.length > 0) {
+      Logger.log(
+        `[GateShell:${this.sessionId}] Menu parse returned 0; keeping cached ${this.cachedServerList.length} servers`,
+      );
+      return this.cachedServerList;
+    }
+    return [];
   }
 
   /** 检查输出中是否包含 shell 提示符 */
@@ -209,8 +312,7 @@ export class GateShellManager {
     Logger.log(`[GateShell:${this.sessionId}] After select (${output.length} chars), last 200: ${cleanOutput.slice(-200)}`);
 
     if (this.hasShellPrompt(output)) {
-      this.connectedToServer = true;
-      Logger.log(`[GateShell:${this.sessionId}] Connected to server ${serverIndex}`);
+      this.markConnected(serverIndex);
       return;
     }
 
@@ -220,7 +322,7 @@ export class GateShellManager {
     const extraOutput = await this.readUntilIdle(3000, 15000);
 
     if (this.hasShellPrompt(extraOutput)) {
-      this.connectedToServer = true;
+      this.markConnected(serverIndex);
       Logger.log(`[GateShell:${this.sessionId}] Connected to server ${serverIndex} (after extra enter)`);
       return;
     }
@@ -233,26 +335,27 @@ export class GateShellManager {
 
   /** 在已连接的服务器上执行命令 */
   async executeCommand(command: string, timeoutMs = 30000): Promise<string> {
-    if (!this.channel || !this.connectedToServer) {
+    if (!this.channel || this.phase !== 'server') {
       throw new ToolError('GATESHELL_NOT_CONNECTED', 'Not connected to a server');
     }
     const marker = `__END_${crypto.randomUUID().slice(0, 8)}__`;
-    // 等待 "\n" + marker，确保匹配的是 echo 输出而非命令回显
-    this.channel.write(`${command}; echo "${marker}"\r`);
-    const rawOutput = await this.readUntil(`\n${marker}`, timeoutMs);
-    const output = stripAnsi(rawOutput);
-    const lines = output.split('\n');
-    const markerIdx = lines.findIndex((l, i) => i > 0 && l.includes(marker));
-    const resultLines = lines.slice(1, markerIdx !== -1 ? markerIdx : undefined);
-    return resultLines.join('\n').trim();
+    this.channel.write(`${command}; echo ${marker}\r`);
+    const rawOutput = await this.readUntil(marker, timeoutMs);
+    return extractCommandOutput(rawOutput, marker);
   }
 
-  /** 断开与当前服务器的连接 */
+  /** 断开与当前服务器的连接，回到堡垒机菜单 */
   async disconnectServer(): Promise<void> {
     if (!this.channel) return;
+    if (this.phase !== 'server') {
+      this.currentServerIndex = null;
+      return;
+    }
     this.channel.write('exit\r');
-    this.connectedToServer = false;
-    Logger.log(`[GateShell:${this.sessionId}] Disconnected from server`);
+    await this.readUntilIdle(1500, 8000);
+    this.phase = 'menu';
+    this.currentServerIndex = null;
+    Logger.log(`[GateShell:${this.sessionId}] Disconnected from server, back at menu`);
   }
 
   /** 关闭 shell channel */
@@ -261,17 +364,24 @@ export class GateShellManager {
       this.channel.end();
       this.channel = null;
     }
-    this.connectedToServer = false;
+    this.phase = 'closed';
+    this.currentServerIndex = null;
     Logger.log(`[GateShell:${this.sessionId}] Shell closed`);
   }
 
   /** 是否已连接到内网服务器 */
   isConnectedToServer(): boolean {
-    return this.connectedToServer;
+    return this.phase === 'server';
   }
 
   /** 获取缓存的服务器列表 */
   getCachedServerList(): ServerEntry[] {
     return this.cachedServerList;
+  }
+
+  private markConnected(serverIndex: number): void {
+    this.phase = 'server';
+    this.currentServerIndex = serverIndex;
+    Logger.log(`[GateShell:${this.sessionId}] Connected to server ${serverIndex}`);
   }
 }
