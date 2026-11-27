@@ -97,6 +97,21 @@ export class GateShellManager {
   private cachedServerList: ServerEntry[] = [];
   private currentServerIndex: number | null = null;
   private readonly sessionId = crypto.randomUUID();
+  private busy = false;
+
+  // Do not queue terminal operations: a queued command could run after another
+  // caller switches hosts. Reject overlaps before sending any input instead.
+  private async exclusively<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.busy) {
+      throw new ToolError('GATESHELL_BUSY', 'GateShell operation in progress; no input sent');
+    }
+    this.busy = true;
+    try {
+      return await operation();
+    } finally {
+      this.busy = false;
+    }
+  }
 
   constructor(private readonly sshClient: Client) {}
 
@@ -109,20 +124,33 @@ export class GateShellManager {
     return new Promise<string>((resolve, reject) => {
       let buf = '';
       const ch = this.channel!;
+      const cleanup = () => {
+        clearTimeout(timer);
+        ch.removeListener('data', onData);
+        ch.removeListener('close', onClosed);
+        ch.removeListener('end', onClosed);
+        ch.removeListener('error', onClosed);
+      };
+      const onClosed = () => {
+        cleanup();
+        reject(new ToolError('GATESHELL_NOT_CONNECTED', 'Channel closed while waiting for output'));
+      };
       const timer = setTimeout(() => {
-        ch.removeAllListeners('data');
-        reject(new ToolError('GATESHELL_PARSE_TIMEOUT', `Timeout waiting for "${markers.join('" or "')}"`));
+        cleanup();
+        reject(new ToolError('GATESHELL_PARSE_TIMEOUT', `Timeout waiting for "${markers.join('" or "')}"; command outcome is unknown, do not replay automatically`));
+        this.close();
       }, timeoutMs);
-
       const onData = (data: Buffer) => {
         buf += data.toString('utf-8');
         const cleaned = stripAnsi(buf);
         if (markers.some((m) => outputContainsStandaloneMarker(cleaned, m) || outputContainsStandaloneMarker(buf, m))) {
-          clearTimeout(timer);
-          ch.removeListener('data', onData);
+          cleanup();
           resolve(buf);
         }
       };
+      ch.on('close', onClosed);
+      ch.on('end', onClosed);
+      ch.on('error', onClosed);
       ch.on('data', onData);
     });
   }
@@ -151,6 +179,10 @@ export class GateShellManager {
 
   /** 打开 GateShell 交互式 shell。已有 channel 时复用，避免把菜单/业务机会话冲掉。 */
   async openShell(): Promise<void> {
+    return this.exclusively(() => this.openShellInternal());
+  }
+
+  private async openShellInternal(): Promise<void> {
     if (this.channel) {
       Logger.log(`[GateShell:${this.sessionId}] Reusing existing shell (phase=${this.phase})`);
       return;
@@ -165,6 +197,17 @@ export class GateShellManager {
         }
         this.channel = channel;
         this.phase = 'menu';
+        const invalidate = () => {
+          // Ignore late lifecycle events from a previously replaced channel.
+          if (this.channel !== channel) return;
+          this.channel = null;
+          this.phase = 'closed';
+          this.currentServerIndex = null;
+          this.cachedServerList = [];
+        };
+        channel.on('close', invalidate);
+        channel.on('end', invalidate);
+        channel.on('error', invalidate);
         Logger.log(`[GateShell:${this.sessionId}] Shell opened`);
         resolve();
       });
@@ -176,39 +219,46 @@ export class GateShellManager {
     if (!this.channel) {
       throw new ToolError('GATESHELL_NOT_CONNECTED', 'No channel available');
     }
-    return new Promise<string>((resolve) => {
+    return new Promise<string>((resolve, reject) => {
       let buf = '';
       const ch = this.channel!;
       let idleTimer: ReturnType<typeof setTimeout>;
-
-      const overallTimer = setTimeout(() => {
+      const cleanup = () => {
         clearTimeout(idleTimer);
+        clearTimeout(overallTimer);
         ch.removeListener('data', onData);
-        // 超时也返回已收集的数据，而非报错（可能已经收到了完整列表）
-        resolve(buf);
-      }, timeoutMs);
-
+        ch.removeListener('close', onClosed);
+        ch.removeListener('end', onClosed);
+        ch.removeListener('error', onClosed);
+      };
+      const finish = () => { cleanup(); resolve(buf); };
+      const onClosed = () => {
+        cleanup();
+        reject(new ToolError('GATESHELL_NOT_CONNECTED', 'Channel closed while reading menu'));
+      };
+      const overallTimer = setTimeout(finish, timeoutMs);
       const resetIdle = () => {
         clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => {
-          clearTimeout(overallTimer);
-          ch.removeListener('data', onData);
-          resolve(buf);
-        }, idleMs);
+        idleTimer = setTimeout(finish, idleMs);
       };
-
       const onData = (data: Buffer) => {
         buf += data.toString('utf-8');
         resetIdle();
       };
-
+      ch.on('close', onClosed);
+      ch.on('end', onClosed);
+      ch.on('error', onClosed);
       ch.on('data', onData);
-      resetIdle(); // 启动首次空闲计时
+      resetIdle();
     });
   }
 
   /** 列出可用服务器。已进入业务机时默认返回缓存，避免把 bash 输出当成空菜单。 */
   async listServers(options: { refresh?: boolean } = {}): Promise<ListServersResult> {
+    return this.exclusively(() => this.listServersInternal(options));
+  }
+
+  private async listServersInternal(options: { refresh?: boolean }): Promise<ListServersResult> {
     if (!this.channel) {
       throw new ToolError('GATESHELL_NOT_CONNECTED', 'Shell not opened');
     }
@@ -225,8 +275,8 @@ export class GateShellManager {
       };
     }
 
-    if (this.phase === 'server' && options.refresh) {
-      await this.disconnectServer();
+    if (options.refresh) {
+      await this.disconnectServerInternal();
     }
 
     if (this.phase === 'menu' && this.cachedServerList.length > 0 && !options.refresh) {
@@ -265,13 +315,8 @@ export class GateShellManager {
     const parsed = parseServerList(output);
     if (parsed.length > 0) return parsed;
 
-    if (this.cachedServerList.length > 0) {
-      Logger.log(
-        `[GateShell:${this.sessionId}] Menu parse returned 0; keeping cached ${this.cachedServerList.length} servers`,
-      );
-      return this.cachedServerList;
-    }
-    return [];
+    this.close();
+    throw new ToolError('GATESHELL_PARSE_TIMEOUT', 'No fresh GateShell menu received; reconnect before selecting a server');
   }
 
   /** 检查输出中是否包含 shell 提示符 */
@@ -284,6 +329,22 @@ export class GateShellManager {
 
   /** 连接到指定服务器 */
   async connectServer(serverIndex: number): Promise<void> {
+    return this.exclusively(async () => {
+      if (this.phase === 'server') {
+        if (this.currentServerIndex === serverIndex) return;
+        throw new ToolError('GATESHELL_CONNECT_FAILED', 'Already on a backend host; refresh the menu explicitly before switching hosts');
+      }
+      try {
+        await this.connectServerInternal(serverIndex);
+      } catch (error) {
+        // A failed selection may have moved the cursor or entered another prompt.
+        this.close();
+        throw error;
+      }
+    });
+  }
+
+  private async connectServerInternal(serverIndex: number): Promise<void> {
     if (!this.channel) {
       throw new ToolError('GATESHELL_NOT_CONNECTED', 'Shell not opened');
     }
@@ -335,37 +396,46 @@ export class GateShellManager {
 
   /** 在已连接的服务器上执行命令 */
   async executeCommand(command: string, timeoutMs = 30000): Promise<string> {
+    return this.exclusively(() => this.executeCommandInternal(command, timeoutMs));
+  }
+
+  private async executeCommandInternal(command: string, timeoutMs: number): Promise<string> {
     if (!this.channel || this.phase !== 'server') {
       throw new ToolError('GATESHELL_NOT_CONNECTED', 'Not connected to a server');
     }
     const marker = `__END_${crypto.randomUUID().slice(0, 8)}__`;
-    this.channel.write(`${command}; echo ${marker}\r`);
-    const rawOutput = await this.readUntil(marker, timeoutMs);
-    return extractCommandOutput(rawOutput, marker);
+    const output = this.readUntil(marker, timeoutMs);
+    try {
+      this.channel.write(`${command}; echo ${marker}\r`);
+      return extractCommandOutput(await output, marker);
+    } catch (error) {
+      this.close();
+      // A write failure can precede the reader's rejection.
+      await output.catch(() => {});
+      throw error;
+    }
   }
 
   /** 断开与当前服务器的连接，回到堡垒机菜单 */
   async disconnectServer(): Promise<void> {
-    if (!this.channel) return;
-    if (this.phase !== 'server') {
-      this.currentServerIndex = null;
-      return;
-    }
-    this.channel.write('exit\r');
-    await this.readUntilIdle(1500, 8000);
-    this.phase = 'menu';
-    this.currentServerIndex = null;
-    Logger.log(`[GateShell:${this.sessionId}] Disconnected from server, back at menu`);
+    return this.exclusively(() => this.disconnectServerInternal());
+  }
+
+  private async disconnectServerInternal(): Promise<void> {
+    // Start at a known cursor position; `exit` may only leave a nested shell
+    // or be queued behind a still-running process instead of returning to menu.
+    this.close();
+    await this.openShellInternal();
   }
 
   /** 关闭 shell channel */
   close(): void {
-    if (this.channel) {
-      this.channel.end();
-      this.channel = null;
-    }
+    const channel = this.channel;
+    this.channel = null;
     this.phase = 'closed';
     this.currentServerIndex = null;
+    this.cachedServerList = [];
+    channel?.destroy();
     Logger.log(`[GateShell:${this.sessionId}] Shell closed`);
   }
 

@@ -53,38 +53,44 @@ export function registerListGateShellServersTool(server: McpServer): void {
     "list-gateshell-servers",
     {
       description:
-        "List available servers behind a GateShell (bastion host). Only works for connections with type 'gateshell'. If already connected to a backend host, returns the cached list and current server instead of parsing bash output as an empty menu. Pass refresh=true to exit the host and re-read the bastion menu.",
+        "List available servers behind a GateShell (bastion host). Only works for connections with type 'gateshell'. If already connected to a backend host, returns the cached list and current server. Pass refresh=true to disconnect and rebuild this SSH connection, then read a fresh menu. This ends the current host session. Concurrent terminal operations are rejected with GATESHELL_BUSY.",
       inputSchema: {
         connectionName: z
           .string()
           .optional()
-          .describe("SSH connection name (optional, default is 'default')"),
+          .describe("SSH connection name (optional, defaults to the configured GateShell bastion)"),
         refresh: z
           .boolean()
           .optional()
           .describe(
-            "If true, leave the current backend host (if any) and re-read the bastion menu",
+            "If true, fully reconnect SSH and read a fresh menu; this may terminate processes attached to the old session",
           ),
       },
     },
     async ({ connectionName, refresh }) => {
       try {
-        const config = sshManager.getConfig(connectionName);
+        const name = sshManager.resolveGateShellName(connectionName);
+        const config = sshManager.getConfig(name);
         if (config.type !== "gateshell") {
           return {
             content: [
               {
                 type: "text" as const,
-                text: `Connection '${connectionName || "default"}' is not a gateshell type.`,
+                text: `Connection '${name}' is not a gateshell type. Specify the GateShell connectionName.`,
               },
             ],
             isError: true,
           };
         }
-        await sshManager.connect(connectionName);
-        const gsManager = sshManager.getGateShellManager(connectionName);
-        await gsManager.openShell();
-        const result = await gsManager.listServers({ refresh: refresh === true });
+        const result = await sshManager.withGateShellOperation(name, async () => {
+          // This bastion does not reliably return a menu on a second shell of
+          // the same SSH transport. Refresh must rebuild the transport itself.
+          if (refresh === true) sshManager.disconnectByName(name);
+          await sshManager.connect(name);
+          const gsManager = sshManager.getGateShellManager(name);
+          await gsManager.openShell();
+          return gsManager.listServers();
+        });
         return {
           content: [
             { type: "text" as const, text: formatGateShellListResult(result) },

@@ -17,13 +17,16 @@ export function registerConnectGateShellServerTool(server: McpServer): void {
         connectionName: z
           .string()
           .optional()
-          .describe("SSH connection name (optional, default is 'default')"),
+          .describe("SSH connection name (optional, defaults to the configured GateShell bastion)"),
       },
     },
     async ({ serverIndex, connectionName }) => {
       try {
-        const gsManager = sshManager.getGateShellManager(connectionName);
-        await gsManager.connectServer(serverIndex);
+        const name = sshManager.resolveGateShellName(connectionName);
+        await sshManager.withGateShellOperation(name, async () => {
+          const gsManager = sshManager.getGateShellManager(name);
+          await gsManager.connectServer(serverIndex);
+        });
         return {
           content: [
             {

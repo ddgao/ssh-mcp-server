@@ -11,6 +11,7 @@ export type ToolErrorCode =
   | "GATESHELL_PARSE_TIMEOUT"
   | "GATESHELL_CONNECT_FAILED"
   | "GATESHELL_NOT_CONNECTED"
+  | "GATESHELL_BUSY"
   | "UNKNOWN_ERROR";
 
 export class ToolError extends Error {

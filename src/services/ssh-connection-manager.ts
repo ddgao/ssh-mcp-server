@@ -28,6 +28,21 @@ export class SSHConnectionManager {
   private commandBlacklistRegexes: Map<string, RegExp[]> = new Map();
   private defaultName: string = "default";
   private gateshellManagers: Map<string, GateShellManager> = new Map();
+  private gateShellOperations = new Set<string>();
+
+  /** Keep ownership across transport replacement, not only within one shell. */
+  public async withGateShellOperation<T>(name: string, operation: () => Promise<T>): Promise<T> {
+    if (this.gateShellOperations.has(name)) {
+      throw new ToolError('GATESHELL_BUSY', 'GateShell operation in progress; no input sent');
+    }
+    this.gateShellOperations.add(name);
+    try {
+      return await operation();
+    } finally {
+      this.gateShellOperations.delete(name);
+    }
+  }
+  private static readonly CONNECT_TIMEOUT_MS = 12000;
 
   private constructor() {}
 
@@ -67,9 +82,20 @@ export class SSHConnectionManager {
     this.configs = configs;
     if (defaultName && configs[defaultName]) {
       this.defaultName = defaultName;
-    } else if (Object.keys(configs).length > 0) {
-      this.defaultName = Object.keys(configs)[0];
+    } else if (configs.prod?.type === 'gateshell') {
+      this.defaultName = 'prod';
+    } else {
+      this.defaultName = Object.keys(configs).find(name => configs[name].type === 'gateshell')
+        || Object.keys(configs)[0] || 'default';
     }
+  }
+
+  /** Preserve the installed GateShell routing without overriding explicit names. */
+  public resolveGateShellName(name?: string): string {
+    if (name) return name;
+    if (this.configs[this.defaultName]?.type === 'gateshell') return this.defaultName;
+    return Object.keys(this.configs).find(key => this.configs[key].type === 'gateshell')
+      || this.defaultName;
   }
 
   /**
@@ -108,8 +134,28 @@ export class SSHConnectionManager {
     }
     const config = this.getConfig(key);
     const client = new Client();
+    let transportClosed = false;
+    let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
+    const invalidate = () => {
+      transportClosed = true;
+      clearTimeout(handshakeTimer);
+      // Delayed events from an old client must not remove a newer connection.
+      if (this.clients.get(key) !== client) return;
+      this.connected.set(key, false);
+      this.clients.delete(key);
+      const gsManager = this.gateshellManagers.get(key);
+      gsManager?.close();
+      this.gateshellManagers.delete(key);
+      const statusTimer = this.pendingStatusCollections.get(key);
+      if (statusTimer) clearTimeout(statusTimer);
+      this.pendingStatusCollections.delete(key);
+      this.statusCache.delete(key);
+    };
     const connectionPromise = new Promise<void>(async (resolve, reject) => {
       client.on("ready", () => {
+        if (transportClosed) return;
+        clearTimeout(handshakeTimer);
+        this.clients.set(key, client);
         this.connected.set(key, true);
         Logger.log(
           `Successfully connected to SSH server [${key}] ${config.host}:${config.port}`,
@@ -128,10 +174,12 @@ export class SSHConnectionManager {
           this.pendingStatusCollections.delete(key);
           collectSystemStatus(client, key)
             .then((status) => {
+              if (this.clients.get(key) !== client) return;
               this.statusCache.set(key, status);
               Logger.log(`System status collected for [${key}]`, "info");
             })
             .catch((error) => {
+              if (this.clients.get(key) !== client) return;
               Logger.log(
                 `Failed to collect system status for [${key}]: ${(error as Error).message}`,
                 "error",
@@ -147,7 +195,7 @@ export class SSHConnectionManager {
         this.pendingStatusCollections.set(key, timeoutId);
       });
       client.on("error", (err: Error) => {
-        this.connected.set(key, false);
+        invalidate();
         reject(
           new ToolError(
             "SSH_CONNECTION_FAILED",
@@ -157,15 +205,15 @@ export class SSHConnectionManager {
         );
       });
       client.on("close", () => {
-        this.connected.set(key, false);
-        this.clients.delete(key);
-        this.pendingConnections.delete(key);
+        invalidate();
+        reject(new ToolError('SSH_CONNECTION_FAILED', `SSH connection [${key}] closed`, true));
         Logger.log(`SSH connection [${key}] closed`, "info");
       });
       const sshConfig: any = {
         host: config.host,
         port: config.port,
         username: config.username,
+        readyTimeout: SSHConnectionManager.CONNECT_TIMEOUT_MS,
       };
       // Add SOCKS proxy configuration if provided
       if (config.socksProxy) {
@@ -251,14 +299,23 @@ export class SSHConnectionManager {
           ),
         );
       }
+      handshakeTimer = setTimeout(() => {
+        invalidate();
+        reject(new ToolError('SSH_CONNECTION_FAILED', `SSH connection [${key}] timed out after ${SSHConnectionManager.CONNECT_TIMEOUT_MS}ms`, true));
+        client.end();
+      }, SSHConnectionManager.CONNECT_TIMEOUT_MS);
       client.connect(sshConfig);
     });
     this.pendingConnections.set(key, connectionPromise);
 
     try {
       await connectionPromise;
+      if (transportClosed) {
+        throw new ToolError('SSH_CONNECTION_FAILED', `SSH connection [${key}] closed during setup`, true);
+      }
       this.clients.set(key, client);
     } finally {
+      clearTimeout(handshakeTimer);
       this.pendingConnections.delete(key);
     }
   }
@@ -386,18 +443,21 @@ export class SSHConnectionManager {
   ): Promise<string> {
     const config = this.getConfig(name);
     if (config.type === 'gateshell') {
-      const gsManager = this.gateshellManagers.get(name || this.defaultName);
-      if (!gsManager || !gsManager.isConnectedToServer()) {
-        throw new ToolError(
-          'GATESHELL_NOT_CONNECTED',
-          'Not connected to any server through GateShell. Call connect-gateshell-server first.',
-          false,
-        );
-      }
-      const commandToRun = directory
-        ? `cd -- ${JSON.stringify(directory)} && ${cmdString}`
-        : cmdString;
-      return gsManager.executeCommand(commandToRun, options.timeout || 30000);
+      const key = name || this.defaultName;
+      return this.withGateShellOperation(key, async () => {
+        const gsManager = this.gateshellManagers.get(key);
+        if (!gsManager || !gsManager.isConnectedToServer()) {
+          throw new ToolError(
+            'GATESHELL_NOT_CONNECTED',
+            'Not connected to any server through GateShell. Call connect-gateshell-server first.',
+            false,
+          );
+        }
+        const commandToRun = directory
+          ? `cd -- ${JSON.stringify(directory)} && ${cmdString}`
+          : cmdString;
+        return gsManager.executeCommand(commandToRun, options.timeout || 30000);
+      });
     }
 
     // Validate command input and security
